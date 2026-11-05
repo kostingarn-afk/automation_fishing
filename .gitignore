@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Артефакты прогонов: создаются кодом заново, в репозиторий не попадают
+# (см. AGENTS.md — trace/, fail/, probe/ не правятся руками)
+trace/
+fail/
+probe/
+
+# Локальный инструментарий OpenCode (команды /opsx-*, скилы OpenSpec)
+.opencode/
+
+# Прочее
+*.log
+Thumbs.db
+desktop.ini
