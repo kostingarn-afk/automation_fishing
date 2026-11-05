@@ -355,6 +355,8 @@ optimization_fishing/
   README.md                      # этот файл
   wowfish-actualization-plan.md  # контекст задачи: факты, константы, перспектива
   AGENTS.md                      # путь к игре, версия клиента, правила работы
+  .gitignore                     # __pycache__, trace/, fail/, probe/, .opencode/
+  .gitattributes                 # LF в репозитории, бинарные расширения
   habr-335580-wow-fishing-bot.md # конспект исходной статьи (2017)
   demo/
     requirements.txt
@@ -364,9 +366,9 @@ optimization_fishing/
   openspec/
     specs/                       # действующие требования (game-capture, bite-detection, fishing-session)
     changes/archive/             # завершённый change wowfish-demo
-  trace/                         # трассы прогонов
-  fail/                          # кадры отказов
-  probe/                         # записи каналов и отчёты подбора
+  trace/                         # трассы прогонов (в git не попадают)
+  fail/                          # кадры отказов (в git не попадают)
+  probe/                         # записи каналов и отчёты подбора (в git не попадают)
 ```
 
 ---
@@ -379,3 +381,19 @@ optimization_fishing/
 | [`openspec/specs/`](./openspec/specs) | требования: захват окна, детекция поклёвки, сессия рыбалки |
 | [`openspec/changes/archive/2026-11-05-wowfish-demo`](./openspec/changes/archive/2026-11-05-wowfish-demo) | как принималось решение: design, спеки, задачи, результаты |
 | [`habr-335580-wow-fishing-bot.md`](./habr-335580-wow-fishing-bot.md) | исходный бот (Python 2, macOS, 2017) и его проблемы |
+
+---
+
+## 13. Работа с git
+
+Репозиторий: `origin` → <https://github.com/kostingarn-afk/automation_fishing>, ветка `main`.
+
+- **В git:** исходники `demo/`, `openspec/`, документация. **Не попадают:** `__pycache__/`,
+  `trace/`, `fail/`, `probe/` (артефакты прогонов) и `.opencode/` (локальные команды и скилы).
+  Каталоги артефактов код создаёт сам, после клона их восстанавливать не нужно.
+- **Артефакты не коммитить:** записи каналов и кадры отказов не воспроизводимы и содержат
+  изображения экрана игры; история git для них — неподходящее место.
+- **`.gitattributes` держит LF в репозитории.** Без него `core.autocrlf=true` на Windows даёт
+  ложные диффы по всем строкам. Если такой дифф всё же появился — `git add --renormalize .`.
+- **Отправка:** `git push -u origin main`; git запросит логин и PAT (пароль GitHub не подходит).
+  Креды удобно сохранить в Git Credential Manager, чтобы не вводить токен каждый раз.
