@@ -395,5 +395,12 @@ optimization_fishing/
   изображения экрана игры; история git для них — неподходящее место.
 - **`.gitattributes` держит LF в репозитории.** Без него `core.autocrlf=true` на Windows даёт
   ложные диффы по всем строкам. Если такой дифф всё же появился — `git add --renormalize .`.
-- **Отправка:** `git push -u origin main`; git запросит логин и PAT (пароль GitHub не подходит).
-  Креды удобно сохранить в Git Credential Manager, чтобы не вводить токен каждый раз.
+- **Отправка:** `git push -u origin main` по SSH — `origin` указывает на
+  `git@github.com:kostingarn-afk/automation_fishing.git`. Доступ по ключу `~/.ssh/id_ed25519`
+  (Authentication Key в GitHub), пароля у ключа нет — push идёт без запросов.
+- **Переезд на другую машину:** `ssh-keygen -t ed25519 -C "msi@work"`; принять ключ хоста
+  `ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts`, сверив отпечаток с официальным
+  `SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU`; публичную часть добавить в GitHub →
+  Settings → SSH and GPG keys; проверить `ssh -T git@github.com` (ждём `Hi <логин>!`).
+- **Fallback, если SSH недоступен:** `git remote set-url origin https://github.com/kostingarn-afk/automation_fishing.git`
+  и токен вместо пароля — fine-grained PAT с правом `contents: write` (пароль GitHub не подходит).
