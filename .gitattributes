@@ -1,0 +1,17 @@
+# Нормализация переводов строк: в репозитории LF независимо от ОС.
+# Без этого core.autocrlf=true на Windows даёт ложные диффы по всем строкам.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+
+# Бинарные — не трогать
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.bmp   binary
+*.npy   binary
