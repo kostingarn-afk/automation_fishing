@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -23,6 +23,47 @@ MIN_AREA = 10
 # `SPLASH_RISE`), здесь остаётся только форма окна и относительный критерий роста.
 SPLASH_WINDOW_HALF = 15
 SPLASH_RISE_RATIO = 1.15
+
+# Вода на кадре клиента. Пределы широкие: измеренная тёмная вода (ночь, глубокая тень) —
+# H 86–90, S 133–160, V 59–73; дневная — H 90–100, S 60–120, V 120–200. Небо, берег,
+# интерфейс и доспех в эти пределы не попадают: у них другой тон либо низкая насыщенность.
+WATER_HUE_RANGE = (70, 115)
+WATER_SATURATION_MIN = 50
+WATER_VALUE_RANGE = (25, 215)
+# Мутная и илистая вода уходит в жёлто-коричневый тон (замер живой сцены: H 20–28,
+# S 103–129, V 80–102), поэтому второй путь берёт преобладающий оттенок кадра: вода —
+# самое большое однородное по тону поле. Доля пикселей отсекает кадры без воды вовсе.
+WATER_DOMINANT_HUE_BIN = 16
+WATER_DOMINANT_SATURATION_MIN = 40
+WATER_DOMINANT_VALUE_MIN = 20
+WATER_DOMINANT_SHARE = 0.25
+# Открытие снимает пиксельный шум, закрытие заливает блики и пену внутри воды.
+WATER_OPEN_KERNEL = 3
+WATER_CLOSE_KERNEL = 15
+# Санитарные проверки: без них «водой» станет любой голубоватый уголок интерфейса.
+WATER_MIN_FRACTION = 0.10
+WATER_MIN_SIDE_FRACTION = 0.20
+# Отступ области поиска от границ воды: точка заброса не должна упираться в кромку.
+WATER_MARGIN = 8
+# Кандидат в поплавок обязан стоять в воде: центр кластера — сам объект (у поплавка он
+# «не вода»), поэтому проверяется кольцо вокруг него. Замер по записи probe/20261106-092059
+# на 340 кадрах: у поплавка доля «водных» пикселей в кольце 0.77–1.00 (медиана 0.93),
+# у шипов наплечника персонажа — медиана 0.50. Близость к воде считается по насыщенности
+# и яркости самой воды сцены: доспех и берег насыщеннее и ярче (design D10).
+WATER_SIMILARITY_SAT = 1.35
+WATER_SIMILARITY_VAL = 1.45
+WATER_AROUND_SHARE = 0.75
+WATER_AROUND_RING = 10
+# Порог «ярких» пикселей всплеска относительно яркости воды: вода в кадре поклёвки
+# остаётся собой, а пена всплеска в 2–3 раза ярче (замер живой сцены 06.11.2026:
+# вода V≈84, пена V≈200). Порог ниже яркости воды обращает счётчик в насыщение —
+# база 5545 из 5625, всплеск не детектируется никогда (design D4).
+BURST_VALUE_RATIO = 1.5
+# Порог «ярких» пикселей всплеска относительно яркости воды: вода в кадре поклёвки
+# остаётся собой, а пена всплеска в 2–3 раза ярче (замер живой сцены 06.11.2026:
+# вода V≈84, пена V≈200). Порог ниже яркости воды обращает счётчик в насыщение —
+# база 5545 из 5625, всплеск не детектируется никогда (design D4).
+BURST_VALUE_RATIO = 1.5
 
 # Поплавок красно-белый; на ROI 576x324 занимает единицы-десятки пикселей.
 # Пороги измерены на реальных кадрах (design.md §10): поплавок area 51–66, Vmean 145,
@@ -50,6 +91,32 @@ TRACK_VALUE_MIN = 105
 
 
 @dataclass(frozen=True)
+class BobberPreset:
+    """Пределы поплавка: по умолчанию — строгий пресет захвата (`TRACK_*`).
+
+    Калибровка подменяет пределы на измеренные в текущей сцене (design D4), поэтому
+    детекция не зависит от освещения и точки мира.
+    """
+
+    hue_max: int = TRACK_HUE_MAX
+    saturation_min: int = TRACK_SATURATION_MIN
+    value_min: int = TRACK_VALUE_MIN
+    area_min: int = TRACK_MIN_AREA
+    area_max: int = TRACK_MAX_AREA
+
+
+TRACK_PRESET = BobberPreset()
+# Верификация исхода остаётся на мягких пределах: строгий пресет там давал ложные `OK`.
+VERIFY_PRESET = BobberPreset(
+    hue_max=RED_HUE_MAX,
+    saturation_min=BOBBER_SATURATION_MIN,
+    value_min=BOBBER_VALUE_MIN,
+    area_min=BOBBER_MIN_AREA,
+    area_max=BOBBER_MAX_AREA,
+)
+
+
+@dataclass(frozen=True)
 class Blob:
     """Кластер: центр описывающего прямоугольника в пикселях кадра и площадь в пикселях.
 
@@ -60,6 +127,145 @@ class Blob:
     cx: float
     cy: float
     area: int
+
+
+@dataclass(frozen=True)
+class WaterLimits:
+    """Пределы «водности» воды: насыщенность, яркость и порог ярких пикселей всплеска.
+
+    Считаются по самой воде сцены, поэтому подходят и для тёмной, и для светлой воды:
+    берег, трава и доспех всегда насыщеннее и ярче воды (design D10). `burst_value` —
+    яркость, выше которой начинается пена всплеска: ниже яркости воды счётчик ярких
+    пикселей насыщается, и поклёвка перестаёт отличаться от покоя (design D4).
+    """
+
+    saturation_max: float
+    value_max: float
+    burst_value: float
+
+
+@dataclass(frozen=True)
+class WaterMask:
+    """Маска воды, её границы и пределы «водности» в координатах кадра клиента."""
+
+    mask: np.ndarray
+    left: int
+    top: int
+    width: int
+    height: int
+    limits: WaterLimits | None = None
+
+
+def detect_water(frame: np.ndarray | None) -> WaterMask | None:
+    """Крупнейшая связная область воды на кадре клиента или `None`, если воды нет.
+
+    Два пути, потому что цвет воды в игре разный: сначала пределы сине-зелёной воды
+    (`WATER_*`), затем преобладающий оттенок кадра — он ловит мутную и илистую воду,
+    которая в сине-зелёные пределы не попадает (design D1). В обоих случаях маска
+    чистится морфологией (открытие — шум, закрытие — блики и пена) и проверяется доля
+    в кадре: иначе «водой» окажется уголок интерфейса.
+    """
+    if frame is None or frame.ndim != 3 or frame.shape[2] < 3 or frame.size == 0:
+        return None
+    for raw in (_colour_water_mask(frame), _dominant_hue_mask(frame)):
+        if raw is None:
+            continue
+        water = _largest_water_region(_clean_water_mask(raw), frame.shape)
+        if water is not None:
+            return replace(water, limits=_water_limits(frame, raw))
+    return None
+
+
+def _water_limits(frame: np.ndarray, raw: np.ndarray) -> WaterLimits | None:
+    """Пределы «водности» по самой воде: медианы насыщенности и яркости с запасом.
+
+    Медианы считаются по исходной, ещё не сомкнутой маске: закрытие 15×15 заливает доспех
+    «водой», и пределы перестают что-либо отсекать (design D10).
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    inside = raw > 0
+    if not inside.any():
+        return None
+    median_s = float(np.median(hsv[:, :, 1][inside]))
+    median_v = float(np.median(hsv[:, :, 2][inside]))
+    return WaterLimits(
+        saturation_max=WATER_SIMILARITY_SAT * median_s,
+        value_max=WATER_SIMILARITY_VAL * median_v,
+        burst_value=BURST_VALUE_RATIO * median_v,
+    )
+
+
+def _colour_water_mask(frame: np.ndarray) -> np.ndarray | None:
+    """Маска воды по пределам сине-зелёного тона (до морфологии)."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower = np.array([WATER_HUE_RANGE[0], WATER_SATURATION_MIN, WATER_VALUE_RANGE[0]], np.uint8)
+    upper = np.array([WATER_HUE_RANGE[1], 255, WATER_VALUE_RANGE[1]], np.uint8)
+    return cv2.inRange(hsv, lower, upper)
+
+
+def _dominant_hue_mask(frame: np.ndarray) -> np.ndarray | None:
+    """Маска воды по преобладающему оттенку кадра (до морфологии): мутная вода, ил."""
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0].astype(np.int32) // WATER_DOMINANT_HUE_BIN
+    counts = np.bincount(hue.ravel(), minlength=180 // WATER_DOMINANT_HUE_BIN + 1)
+    dominant = int(np.argmax(counts))
+    if counts[dominant] < WATER_DOMINANT_SHARE * hue.size:
+        return None
+    suitable = (
+        (hue == dominant)
+        & (hsv[:, :, 1] >= WATER_DOMINANT_SATURATION_MIN)
+        & (hsv[:, :, 2] >= WATER_DOMINANT_VALUE_MIN)
+    )
+    return suitable.astype(np.uint8) * 255
+
+
+def _clean_water_mask(mask: np.ndarray) -> np.ndarray:
+    """Морфология маски воды: открытие убирает шум, закрытие заливает блики и пену."""
+    open_kernel = np.ones((WATER_OPEN_KERNEL, WATER_OPEN_KERNEL), np.uint8)
+    close_kernel = np.ones((WATER_CLOSE_KERNEL, WATER_CLOSE_KERNEL), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, open_kernel)
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+
+
+def _largest_water_region(mask: np.ndarray, shape: tuple[int, ...]) -> WaterMask | None:
+    """Крупнейшая компонента маски, прошедшая санитарные проверки площади и сторон."""
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if count <= 1:  # только фон
+        return None
+    index = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    area = int(stats[index, cv2.CC_STAT_AREA])
+    if area < WATER_MIN_FRACTION * mask.size:
+        return None
+    left = int(stats[index, cv2.CC_STAT_LEFT])
+    top = int(stats[index, cv2.CC_STAT_TOP])
+    width = int(stats[index, cv2.CC_STAT_WIDTH])
+    height = int(stats[index, cv2.CC_STAT_HEIGHT])
+    if width < WATER_MIN_SIDE_FRACTION * shape[1] or height < WATER_MIN_SIDE_FRACTION * shape[0]:
+        return None
+    component = labels == index
+    return WaterMask(
+        mask=component,
+        left=left,
+        top=top,
+        width=width,
+        height=height,
+    )
+
+
+def search_box(water: WaterMask, margin: int = WATER_MARGIN) -> tuple[int, int, int, int]:
+    """Прямоугольник области поиска: bbox воды, сжатый на отступ.
+
+    Узкую полосу воды отступ не съедает целиком: если сжатие делает область пустой,
+    возвращается исходный bbox.
+    """
+    if water.width <= 2 * margin or water.height <= 2 * margin:
+        return water.left, water.top, water.width, water.height
+    return (
+        water.left + margin,
+        water.top + margin,
+        water.width - 2 * margin,
+        water.height - 2 * margin,
+    )
 
 
 def to_gray(img: np.ndarray) -> np.ndarray:
@@ -151,20 +357,81 @@ def find_red_candidates(
     return candidates
 
 
-def find_tracker_candidates(roi: np.ndarray) -> list[Blob]:
-    """Кандидаты на поплавок для захвата: строгий насыщенный красный малой площади.
+def find_tracker_candidates(
+    roi: np.ndarray,
+    preset: BobberPreset | None = None,
+    water: WaterLimits | None = None,
+) -> list[Blob]:
+    """Кандидаты на поплавок для захвата: насыщенный красный кластер в воде.
 
-    Отличается от `find_red_candidates` порогами (`TRACK_*`): блики воды отсекаются,
-    поэтому захват не уходит на воду (design.md §11).
+    Отличается от `find_red_candidates` порогами по умолчанию (`TRACK_*`): блики воды
+    отсекаются, поэтому захват не уходит на воду (design.md §11). `water` — пределы
+    «водности» сцены: кластер, вокруг которого не вода (берег, трава, доспех персонажа),
+    кандидатом не считается (design D10).
     """
-    return find_red_candidates(
+    limits = TRACK_PRESET if preset is None else preset
+    blobs = find_red_candidates(
         roi,
-        min_area=TRACK_MIN_AREA,
-        max_area=TRACK_MAX_AREA,
-        saturation_min=TRACK_SATURATION_MIN,
-        value_min=TRACK_VALUE_MIN,
-        hue_max=TRACK_HUE_MAX,
+        min_area=limits.area_min,
+        max_area=limits.area_max,
+        saturation_min=limits.saturation_min,
+        value_min=limits.value_min,
+        hue_max=limits.hue_max,
     )
+    if water is None:
+        return blobs
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    return [blob for blob in blobs if water_around(hsv, blob, water)]
+
+
+def water_around(
+    hsv: np.ndarray,
+    blob: Blob,
+    water: WaterLimits,
+    ring: int = WATER_AROUND_RING,
+    threshold: float = WATER_AROUND_SHARE,
+) -> bool:
+    """Стоит ли кластер в воде: доля «водных» пикселей в кольце вокруг него.
+
+    Проверять центр кластера бессмысленно: центр — сам объект, у поплавка он всегда
+    «не вода». Кольцо же у поплавка водное, а у шипа наплечника, травы на берегу и деталей
+    доспеха — нет (design D10). Замеряется по кадру, а не по маске сцены: персонаж
+    в анимации постоянно смещается, и маска, снятая до каста, быстро устаревает.
+    Внутренний радиус берётся по площади кластера, чтобы сам объект не попадал в замер.
+    """
+    inner = max(10, int(math.sqrt(max(blob.area, 1) / math.pi)) + 6)
+    outer = inner + ring
+    height, width = hsv.shape[:2]
+    x, y = int(round(blob.cx)), int(round(blob.cy))
+    y0, y1 = max(0, y - outer), min(height, y + outer + 1)
+    x0, x1 = max(0, x - outer), min(width, x + outer + 1)
+    window = hsv[y0:y1, x0:x1]
+    if window.size == 0:
+        return False
+    core = np.zeros(window.shape[:2], dtype=bool)
+    core_y, core_x = y - y0, x - x0
+    core[
+        max(0, core_y - inner) : core_y + inner + 1,
+        max(0, core_x - inner) : core_x + inner + 1,
+    ] = True
+    shell = ~core
+    if not shell.any():
+        return False
+    ring_pixels = window[shell]
+    similar = (ring_pixels[:, 1] <= water.saturation_max) & (
+        ring_pixels[:, 2] <= water.value_max
+    )
+    return float(similar.mean()) >= threshold
+
+
+def inside_mask(mask: np.ndarray, x: float, y: float) -> bool:
+    """Лежит ли точка внутри маски (координаты пикселей кадра)."""
+    height, width = mask.shape[:2]
+    column = int(round(x))
+    row = int(round(y))
+    if not (0 <= row < height and 0 <= column < width):
+        return False
+    return bool(mask[row, column])
 
 
 def find_bobber(
@@ -173,13 +440,37 @@ def find_bobber(
     radius: float = BOBBER_RADIUS,
     min_area: int = BOBBER_MIN_AREA,
     max_area: int = BOBBER_MAX_AREA,
+    mask: np.ndarray | None = None,
+    preset: BobberPreset | None = None,
 ) -> Blob | None:
     """Самый крупный красный кластер поплавка в окне проверки.
 
     `near` — точка в пикселях кадра (обычно центроид всплеска): кластеры дальше `radius`
     игнорируются, поэтому берег, костёр и доспех персонажа вне окна не влияют (design §10).
+    `mask` — маска воды: кластеры вне воды игнорируются. `preset` — пределы кластера;
+    по умолчанию мягкий `VERIFY_PRESET`: строгий пресет захвата здесь давал ложные `OK`.
     """
-    for blob in find_red_candidates(roi, min_area, max_area):
+    limits = (
+        preset
+        if preset is not None
+        else BobberPreset(
+            hue_max=RED_HUE_MAX,
+            saturation_min=BOBBER_SATURATION_MIN,
+            value_min=BOBBER_VALUE_MIN,
+            area_min=min_area,
+            area_max=max_area,
+        )
+    )
+    for blob in find_red_candidates(
+        roi,
+        limits.area_min,
+        limits.area_max,
+        limits.saturation_min,
+        limits.value_min,
+        limits.hue_max,
+    ):
+        if mask is not None and not inside_mask(mask, blob.cx, blob.cy):
+            continue
         if near is None or math.hypot(blob.cx - near[0], blob.cy - near[1]) <= radius:
             return blob
     return None
@@ -191,13 +482,24 @@ def bobber_present(
     radius: float = BOBBER_RADIUS,
     min_area: int = BOBBER_MIN_AREA,
     max_area: int = BOBBER_MAX_AREA,
+    mask: np.ndarray | None = None,
+    preset: BobberPreset | None = None,
 ) -> bool:
     """Есть ли поплавок в окне проверки.
 
     Без `near` ищется по всему кадру: в сцене с красным рельефом это даёт ложные
     срабатывания, поэтому в сессии всегда передаётся точка подсечки.
     """
-    return find_bobber(roi, near=near, radius=radius, min_area=min_area, max_area=max_area) is not None
+    blob = find_bobber(
+        roi,
+        near=near,
+        radius=radius,
+        min_area=min_area,
+        max_area=max_area,
+        mask=mask,
+        preset=preset,
+    )
+    return blob is not None
 
 
 def to_value(img: np.ndarray) -> np.ndarray:
@@ -251,6 +553,35 @@ def bright_centroid(
         return None
     ys, xs = np.nonzero(mask)
     return float(left + xs.mean()), float(top + ys.mean())
+
+
+def colour_at(
+    img: np.ndarray,
+    center: tuple[float, float],
+    preset: BobberPreset | None = None,
+    radius: int = 8,
+) -> tuple[float, float, float] | None:
+    """Средние H/S/V пикселей поплавка в окрестности точки (по пределам пресета).
+
+    Нужны калибровке: по подтверждённым `OK` она учит настоящий цвет поплавка в сцене.
+    Средний оттенок корректен для красного (H около 0): кластер не пересекает границу
+    шкалы 0/180, поэтому усреднение по кругу не требуется.
+    """
+    window = _window(img, center, radius)
+    if window is None:
+        return None
+    patch, _, _ = window
+    limits = TRACK_PRESET if preset is None else preset
+    mask = _red_mask(patch, limits.saturation_min, limits.value_min, limits.hue_max)
+    if not mask.any():
+        return None
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    values = hsv[mask > 0]
+    return (
+        float(values[:, 0].mean()),
+        float(values[:, 1].mean()),
+        float(values[:, 2].mean()),
+    )
 
 
 def frame_delta(a: np.ndarray, b: np.ndarray) -> float:

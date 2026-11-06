@@ -30,6 +30,14 @@ MOUSEEVENTF_VIRTUALDESK = 0x4000
 
 KEYEVENTF_KEYUP = 0x0002
 
+# Клавиша прыжка — именованный ключ наравне с символами (`send_key`).
+VK_SPACE = 0x20
+KEY_NAMES = {"space": VK_SPACE}
+JUMP_KEY = "space"
+# Удержание клавиши прыжка: `down` и `up` одним пакетом клиент на 60 FPS не видит
+# (как `CLICK_HOLD` у мыши). Для каста диапазон не используется — там путь проверен.
+KEY_HOLD = (0.06, 0.12)
+
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
@@ -216,19 +224,33 @@ def send_right_click_legacy(x: int, y: int) -> bool:
     return True
 
 
-def send_key(key: str) -> bool:
-    """Одиночное нажатие клавиши по символу: «1»..«9», «a»..«z»."""
-    if not key or len(key) != 1:
-        raise ValueError(f"ожидается один символ, получено {key!r}")
-    vk = ord(key.upper())
-    if not 0x30 <= vk <= 0x5A:
-        raise ValueError(f"неподдерживаемая клавиша {key!r}")
-    return _send(
-        [
-            INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, 0, 0, 0, None)),
-            INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, None)),
-        ]
-    )
+def send_key(key: str, hold: float = 0.0) -> bool:
+    """Нажатие клавиши: символ («1»..«9», «a»..«z») или именованный ключ `KEY_NAMES`.
+
+    `hold > 0` разносит `down` и `up` по времени двумя вызовами `SendInput`:
+    одномоментные события клиент на 60 FPS не различает. Каст (`hold=0`)
+    по-прежнему уходит одним пакетом — его тайминги подобраны на клиенте.
+    """
+    if not key:
+        raise ValueError("пустое имя клавиши")
+    vk = KEY_NAMES.get(key.lower())
+    if vk is None:
+        if len(key) != 1:
+            raise ValueError(f"ожидается один символ или именованный ключ, получено {key!r}")
+        vk = ord(key.upper())
+        if not 0x30 <= vk <= 0x5A:
+            raise ValueError(f"неподдерживаемая клавиша {key!r}")
+    down = INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, 0, 0, 0, None))
+    up = INPUT(type=INPUT_KEYBOARD, ki=KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, None))
+    if hold <= 0:
+        return _send([down, up])
+    if not _send([down]):
+        return False
+    time.sleep(hold)
+    if _send([up]):
+        return True
+    # `up` не прошёл: повтор дешевле, чем оставить клавишу логически нажатой
+    return _send([up])
 
 
 def cast(window: win.GameWindow, key: str) -> None:
@@ -236,6 +258,19 @@ def cast(window: win.GameWindow, key: str) -> None:
     require_foreground(window)
     if not send_key(key):
         raise OSError(ctypes.get_last_error(), "SendInput: каст не отправлен")
+
+
+def jump(window: win.GameWindow) -> None:
+    """Прыжок: `JUMP_KEY` с удержанием `KEY_HOLD`.
+
+    Фокус проверяется до отправки: инъекция в чужое окно — необратимое действие.
+    `InputBlocked` — окно не в фокусе, `OSError` — `SendInput` не принял нажатие;
+    оба отказа обрабатывает вызывающий код, цикл из-за них не проваливается.
+    """
+    require_foreground(window)
+    hold = random.uniform(KEY_HOLD[0], KEY_HOLD[1])
+    if not send_key(JUMP_KEY, hold=hold):
+        raise OSError(ctypes.get_last_error(), "SendInput: прыжок не отправлен")
 
 
 def strike(
